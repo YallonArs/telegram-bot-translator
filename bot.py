@@ -16,8 +16,9 @@ import logging
 import os
 import tempfile
 import time
+from typing import Any, Awaitable, Callable
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -27,6 +28,8 @@ from aiogram.types import (
 	InlineKeyboardButton,
 	InlineKeyboardMarkup,
 	Message,
+	TelegramObject,
+	Update,
 )
 
 import config
@@ -49,6 +52,46 @@ bot = Bot(
 	default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
 )
 dp = Dispatcher()
+
+
+# ── access control middleware ──────────────────────────────────────────────────
+
+class AllowlistMiddleware(BaseMiddleware):
+	"""Allow everyone to use /start; restrict everything else to ALLOWED_CHAT_IDS."""
+
+	async def __call__(
+		self,
+		handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+		event: TelegramObject,
+		data: dict[str, Any],
+	) -> Any:
+		update: Update = data.get("update") or event  # type: ignore[assignment]
+
+		# Determine the chat id from whatever update type we received
+		chat_id: int | None = None
+		if isinstance(event, Message):
+			chat_id = event.chat.id
+		elif isinstance(event, CallbackQuery) and event.message:
+			chat_id = event.message.chat.id
+
+		# Detect /start commands — they are allowed for everyone
+		is_start = (
+			isinstance(event, Message)
+			and event.text
+			and event.text.strip().startswith("/start")
+		)
+
+		if is_start:
+			return await handler(event, data)
+
+		if chat_id is not None and chat_id not in config.ALLOWED_CHAT_IDS:
+			# Silently ignore — do not respond
+			return
+
+		return await handler(event, data)
+
+
+dp.update.middleware(AllowlistMiddleware())
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -98,6 +141,9 @@ def _settings_text(user_id: int) -> str:
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message) -> None:
+	if message.chat.id not in config.ALLOWED_CHAT_IDS:
+		await message.answer("👋 Привет! Этот бот доступен только для выбранных пользователей.")
+		return
 	await message.answer("👋 Привет! Отправь мне голосовое сообщение — я транскрибирую его "
 							"с помощью Whisper и переведу на нужный язык.\n\n"
 							"Используй /settings чтобы выбрать модель и язык перевода.")
