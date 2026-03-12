@@ -1,4 +1,4 @@
-python-telegram-bot==21.10
+aiogram==3.18.0
 openai-whisper
 deep-translator
 python-dotenv
