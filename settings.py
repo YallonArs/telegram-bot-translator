@@ -34,7 +34,7 @@ LANGUAGE_LABELS: dict[str, str] = {code: label for code, label in LANGUAGES}
 
 @dataclass
 class UserSettings:
-	model: str = "base"
+	model: str = "small"
 	language: str = "ru"
 	last_voice_bytes: bytes | None = None
 	last_voice_duration: int = 0  # seconds, from Telegram message.voice.duration

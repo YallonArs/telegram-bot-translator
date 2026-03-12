@@ -30,6 +30,26 @@ def _get_model(model_name: str) -> whisper.Whisper:
     return _models[model_name]
 
 
+def list_loaded_models() -> list[str]:
+    """Return the names of all currently-cached Whisper models."""
+    with _lock:
+        return list(_models.keys())
+
+
+def unload_model(model_name: str) -> bool:
+    """
+    Remove *model_name* from the in-memory cache.
+
+    Returns True if the model was loaded (and is now removed), False otherwise.
+    """
+    with _lock:
+        if model_name in _models:
+            del _models[model_name]
+            logger.info("Whisper model '%s' unloaded.", model_name)
+            return True
+    return False
+
+
 def transcribe(audio_path: str, model_name: str = "base") -> str:
     """
     Transcribe an audio file to text.

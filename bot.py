@@ -7,6 +7,8 @@ Features
 * Live status editing: received → transcribing → translating → result.
 * /settings command: inline keyboard to switch Whisper model and target language.
 * /benchmark command: runs all Whisper models on last received voice, reports timing.
+* /admin command: restricted to ADMIN_CHAT_ID — shows loaded models & active tasks,
+  with buttons to unload a model or stop a task.
 * Per-user settings stored in memory (settings.py).
 * Fully async: blocking Whisper inference and HTTP calls run in thread pool.
 """
@@ -22,7 +24,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import BaseFilter, Command
 from aiogram.types import (
 	CallbackQuery,
 	InlineKeyboardButton,
@@ -52,6 +54,19 @@ bot = Bot(
 	default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
 )
 dp = Dispatcher()
+
+# ── active task registry ──────────────────────────────────────────────────────
+# key: "uid:<user_id>:msg:<message_id>" → asyncio.Task
+_active_tasks: dict[str, asyncio.Task] = {}
+
+
+def _task_key(user_id: int, message_id: int) -> str:
+	return f"uid:{user_id}:msg:{message_id}"
+
+
+def _register_task(key: str, task: asyncio.Task) -> None:
+	_active_tasks[key] = task
+	task.add_done_callback(lambda t: _active_tasks.pop(key, None))
 
 
 # ── access control middleware ──────────────────────────────────────────────────
@@ -84,6 +99,16 @@ class AllowlistMiddleware(BaseMiddleware):
 		if is_start:
 			return await handler(event, data)
 
+		# Admin commands / callbacks are gated by IsAdmin filter, not this middleware
+		is_admin_event = False
+		if isinstance(event, Message) and event.text:
+			is_admin_event = event.text.strip().startswith("/admin")
+		elif isinstance(event, CallbackQuery) and event.data:
+			is_admin_event = event.data.startswith("admin:")
+
+		if is_admin_event:
+			return await handler(event, data)
+
 		if chat_id is not None and chat_id not in config.ALLOWED_CHAT_IDS:
 			# Silently ignore — do not respond
 			return
@@ -92,6 +117,76 @@ class AllowlistMiddleware(BaseMiddleware):
 
 
 dp.update.middleware(AllowlistMiddleware())
+
+
+# ── admin filter ──────────────────────────────────────────────────────────────
+
+class IsAdmin(BaseFilter):
+	"""Pass only when the event originates from ADMIN_CHAT_ID."""
+
+	async def __call__(self, event: Message | CallbackQuery) -> bool:
+		if config.ADMIN_CHAT_ID is None:
+			return False
+		if isinstance(event, Message):
+			return event.chat.id == config.ADMIN_CHAT_ID
+		if isinstance(event, CallbackQuery) and event.message:
+			return event.message.chat.id == config.ADMIN_CHAT_ID
+		return False
+
+
+# ── admin panel helpers ───────────────────────────────────────────────────────
+
+def _admin_text() -> str:
+	models = transcriber.list_loaded_models()
+	tasks = list(_active_tasks.keys())
+
+	lines = ["🛠 *Admin Panel*\n"]
+
+	if models:
+		lines.append(f"🤖 *Loaded models* ({len(models)}): " + ", ".join(f"`{m}`" for m in models))
+	else:
+		lines.append("🤖 *Loaded models*: none")
+
+	if tasks:
+		lines.append(f"\n📋 *Active tasks* ({len(tasks)}):")
+		for key in tasks:
+			lines.append(f"  • `{key}`")
+	else:
+		lines.append("\n📋 *Active tasks*: none")
+
+	return "\n".join(lines)
+
+
+def _admin_keyboard() -> InlineKeyboardMarkup:
+	rows: list[list[InlineKeyboardButton]] = []
+
+	# Unload buttons (one per loaded model)
+	models = transcriber.list_loaded_models()
+	if models:
+		rows.append([
+			InlineKeyboardButton(
+				text=f"🗑 Unload {m}",
+				callback_data=f"admin:unload:{m}",
+			)
+			for m in models
+		])
+
+	# Stop buttons (one per active task)
+	for key in list(_active_tasks.keys()):
+		# Shorten long keys for button labels
+		label = key if len(key) <= 32 else key[:29] + "…"
+		rows.append([
+			InlineKeyboardButton(
+				text=f"⛔ Stop {label}",
+				callback_data=f"admin:stop:{key}",
+			)
+		])
+
+	# Refresh button always present
+	rows.append([InlineKeyboardButton(text="🔄 Refresh", callback_data="admin:refresh")])
+
+	return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -145,8 +240,8 @@ async def cmd_start(message: Message) -> None:
 		await message.answer("👋 Привет! Этот бот доступен только для выбранных пользователей.")
 		return
 	await message.answer("👋 Привет! Отправь мне голосовое сообщение — я транскрибирую его "
-							"с помощью Whisper и переведу на нужный язык.\n\n"
-							"Используй /settings чтобы выбрать модель и язык перевода.")
+						 "с помощью Whisper и переведу на нужный язык.\n\n"
+						 "Используй /settings чтобы выбрать модель и язык перевода.")
 
 
 @dp.message(Command("settings"))
@@ -157,6 +252,64 @@ async def cmd_settings(message: Message) -> None:
 		reply_markup=_settings_keyboard(uid),
 	)
 
+
+# ── admin command & callbacks ─────────────────────────────────────────────────
+
+@dp.message(IsAdmin(), Command("admin"))
+async def cmd_admin(message: Message) -> None:
+	await message.answer(_admin_text(), reply_markup=_admin_keyboard())
+
+
+@dp.callback_query(IsAdmin(), F.data == "admin:refresh")
+async def cb_admin_refresh(callback: CallbackQuery) -> None:
+	try:
+		await callback.message.edit_text(_admin_text(), reply_markup=_admin_keyboard())
+	except TelegramBadRequest as e:
+		if "message is not modified" not in str(e):
+			raise
+	await callback.answer("Refreshed")
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("admin:unload:"))
+async def cb_admin_unload(callback: CallbackQuery) -> None:
+	model = callback.data.split(":", 2)[2]
+	removed = await asyncio.to_thread(transcriber.unload_model, model)
+	msg = f"Model `{model}` unloaded." if removed else f"Model `{model}` was not loaded."
+	try:
+		await callback.message.edit_text(_admin_text(), reply_markup=_admin_keyboard())
+	except TelegramBadRequest as e:
+		if "message is not modified" not in str(e):
+			raise
+	await callback.answer(msg)
+
+
+@dp.callback_query(IsAdmin(), F.data.startswith("admin:stop:"))
+async def cb_admin_stop(callback: CallbackQuery) -> None:
+	key = callback.data.split(":", 2)[2]
+	task = _active_tasks.get(key)
+	if task and not task.done():
+		task.cancel()
+		msg = f"Task stopped."
+	else:
+		msg = "Task not found or already finished."
+	# Small yield so done_callback has a chance to remove from registry
+	await asyncio.sleep(0)
+	try:
+		await callback.message.edit_text(_admin_text(), reply_markup=_admin_keyboard())
+	except TelegramBadRequest as e:
+		if "message is not modified" not in str(e):
+			raise
+	await callback.answer(msg)
+
+
+# ── non-admin admin callbacks — silently ignore ───────────────────────────────
+
+@dp.callback_query(F.data.startswith("admin:"))
+async def cb_admin_unauthorized(callback: CallbackQuery) -> None:
+	await callback.answer("⛔ Not authorized.", show_alert=True)
+
+
+# ── settings callbacks ────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data == "noop")
 async def cb_noop(callback: CallbackQuery) -> None:
@@ -196,19 +349,17 @@ async def cb_lang(callback: CallbackQuery) -> None:
 	await callback.answer(f"Язык: {label}")
 
 
-@dp.message(F.voice)
-async def handle_voice(message: Message) -> None:
+# ── voice handler ─────────────────────────────────────────────────────────────
+
+async def _process_voice(message: Message, status: Message) -> None:
 	"""Full pipeline: download → transcribe → translate → reply."""
 	uid = message.from_user.id
 	s = user_settings.get(uid)
 	voice_duration: int = message.voice.duration or 1
 
-	# 1. Instant acknowledgement
-	status = await message.reply("⏳ Сообщение получено, обрабатываю…")
-
 	tmp_path: str | None = None
 	try:
-		# 2. Download voice file
+		# 1. Download voice file
 		voice_file = await bot.get_file(message.voice.file_id)
 		with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
 			tmp_path = tmp.name
@@ -219,7 +370,7 @@ async def handle_voice(message: Message) -> None:
 			voice_bytes = f.read()
 		user_settings.set_last_voice(uid, voice_bytes, voice_duration)
 
-		# 3. Transcribe — measure time
+		# 2. Transcribe — measure time
 		await status.edit_text(f"🎙️ Транскрибирую аудио (модель: `{s.model}`)…")
 		t0 = time.monotonic()
 		transcribed: str = await asyncio.to_thread(transcriber.transcribe, tmp_path, s.model)
@@ -229,30 +380,48 @@ async def handle_voice(message: Message) -> None:
 			await status.edit_text("❌ Не удалось распознать речь. Попробуй ещё раз.")
 			return
 
-		# 4. Translate
+		# 3. Translate
 		lang_label = user_settings.LANGUAGE_LABELS.get(s.language, s.language)
 		await status.edit_text(f"🌐 Перевожу на {lang_label}…")
 		translated: str = await asyncio.to_thread(translator.translate, transcribed, s.language)
 
-		# 5. Final reply with transcription time
+		# 4. Final reply
 		rtf = transcribe_elapsed / voice_duration
-		# timing_line = (
-		#     f"⏱ Транскрипция: {transcribe_elapsed:.1f} с "
-		#     f"({rtf:.2f}× RT, модель `{s.model}`)"
-		# )
 		await status.edit_text(f"✅ *Перевод* ({lang_label}):\n\n{translated}\n\n"
-								f"_Оригинал:_\n\n {transcribed}")
-		# f"_Оригинал:_\n\n {transcribed}\n\n{timing_line}")
+							   f"_Оригинал:_\n\n {transcribed}")
+
+	except asyncio.CancelledError:
+		logger.info("Voice task cancelled for user %s", uid)
+		try:
+			await status.edit_text("⛔ Обработка остановлена администратором.")
+		except Exception:
+			pass
+		raise
 
 	except Exception as exc:
 		logger.exception("Error processing voice: %s", exc)
-		await status.edit_text(f"❌ Ошибка: `{type(exc).__name__}: {exc}`")
+		try:
+			await status.edit_text(f"❌ Ошибка: `{type(exc).__name__}: {exc}`")
+		except Exception:
+			pass
+
 	finally:
 		if tmp_path:
 			try:
 				os.unlink(tmp_path)
 			except OSError:
 				pass
+
+
+@dp.message(F.voice)
+async def handle_voice(message: Message) -> None:
+	uid = message.from_user.id
+	# Send initial acknowledgement
+	status = await message.reply("⏳ Сообщение получено, обрабатываю…")
+
+	key = _task_key(uid, message.message_id)
+	task = asyncio.create_task(_process_voice(message, status), name=key)
+	_register_task(key, task)
 
 
 @dp.message(Command("benchmark"))
