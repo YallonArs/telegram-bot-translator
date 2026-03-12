@@ -1,0 +1,7 @@
+[style]
+COLUMN_LIMIT=100
+based_on_style = pep8
+use_tabs = true
+indent_width = 4
+continuation_align_style = VALIGN-RIGHT
+BLANK_LINE_BEFORE_NESTED_CLASS_OR_DEF = false
