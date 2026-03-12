@@ -195,7 +195,8 @@ async def handle_voice(message: Message) -> None:
 		#     f"({rtf:.2f}× RT, модель `{s.model}`)"
 		# )
 		await status.edit_text(f"✅ *Перевод* ({lang_label}):\n\n{translated}\n\n"
-								f"_Оригинал:_\n\n {transcribed}\n\n{timing_line}")
+								f"_Оригинал:_\n\n {transcribed}")
+		# f"_Оригинал:_\n\n {transcribed}\n\n{timing_line}")
 
 	except Exception as exc:
 		logger.exception("Error processing voice: %s", exc)
