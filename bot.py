@@ -367,26 +367,29 @@ async def cb_voice_lang(callback: CallbackQuery) -> None:
 		await callback.answer("❌ Голосовое сообщение больше не доступно.")
 		return
 	
-	message, status = pending_voice_data
+	message, old_status = pending_voice_data
 	
 	try:
-		# Determine transcription mode based on user selection
-		mode = "si" if lang_choice == "si" else "default"
-		
-		# Start processing with the selected mode
-		process_task = asyncio.create_task(
-			_process_voice(message, status, mode),
-			name=key,
-		)
-		_register_task(key, process_task)
-		
-		await callback.answer("✅")
-		
 		# Delete the language selection message
 		try:
 			await callback.message.delete()
 		except Exception:
 			pass
+		
+		# Create a fresh status message for processing
+		new_status = await message.reply("⏳ Сообщение получено, обрабатываю…")
+		
+		# Determine transcription mode based on user selection
+		mode = "si" if lang_choice == "si" else "default"
+		
+		# Start processing with the selected mode
+		process_task = asyncio.create_task(
+			_process_voice(message, new_status, mode),
+			name=key,
+		)
+		_register_task(key, process_task)
+		
+		await callback.answer("✅")
 	
 	except Exception as e:
 		logger.exception("Error in voice language selection: %s", e)
