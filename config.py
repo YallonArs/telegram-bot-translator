@@ -1,10 +1,18 @@
 import os
+from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
 BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
 WHISPER_MODEL: str = os.getenv("WHISPER_MODEL", "base")
+
+# Path to the locally-installed CTranslate2 Sinhala model.
+SINHALA_MODEL_PATH: str = os.getenv(
+    "SINHALA_MODEL_PATH",
+    str(Path.home() / "bot-transcriptor" / "whisper-small-sinhala-ct2"),
+)
 
 # Comma-separated list of chat IDs that have full access.
 # Example in .env:  ALLOWED_CHAT_IDS=123456789,987654321

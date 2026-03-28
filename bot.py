@@ -21,6 +21,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -373,7 +374,7 @@ async def _process_voice(message: Message, status: Message) -> None:
 		# 2. Transcribe — measure time
 		await status.edit_text(f"🎙️ Транскрибирую аудио (модель: `{s.model}`)…")
 		t0 = time.monotonic()
-		transcribed: str = await asyncio.to_thread(transcriber.transcribe, tmp_path, s.model)
+		transcribed: str = await asyncio.to_thread(transcriber.transcribe, tmp_path, s.model, language=s.language)
 		transcribe_elapsed = time.monotonic() - t0
 
 		if not transcribed:
@@ -469,7 +470,7 @@ async def cmd_benchmark(message: Message) -> None:
 		for i, model in enumerate(models):
 			await safe_edit(build_status(model))
 			t0 = time.monotonic()
-			await asyncio.to_thread(transcriber.transcribe, tmp_path, model)
+			await asyncio.to_thread(transcriber.transcribe, tmp_path, model, language=s.language)
 			elapsed = time.monotonic() - t0
 			rtf = elapsed / max(duration, 1)
 			results[model] = (elapsed, rtf)
