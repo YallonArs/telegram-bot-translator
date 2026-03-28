@@ -70,6 +70,24 @@ def _register_task(key: str, task: asyncio.Task) -> None:
 	task.add_done_callback(lambda t: _active_tasks.pop(key, None))
 
 
+# ── pending voice registry ────────────────────────────────────────────────────
+# Store voice message + status message while waiting for language selection
+# key: "uid:<user_id>:msg:<message_id>" → (message, status_message)
+_pending_voices: dict[str, tuple[Message, Message]] = {}
+
+
+def _voice_key(user_id: int, message_id: int) -> str:
+	return f"uid:{user_id}:msg:{message_id}"
+
+
+def _register_pending_voice(key: str, message: Message, status: Message) -> None:
+	_pending_voices[key] = (message, status)
+
+
+def _retrieve_pending_voice(key: str) -> tuple[Message, Message] | None:
+	return _pending_voices.pop(key, None)
+
+
 # ── access control middleware ──────────────────────────────────────────────────
 
 class AllowlistMiddleware(BaseMiddleware):
@@ -318,6 +336,63 @@ async def cb_noop(callback: CallbackQuery) -> None:
 	await callback.answer()
 
 
+# ── voice language selection callbacks ────────────────────────────────────────
+
+def _voice_lang_keyboard() -> InlineKeyboardMarkup:
+	"""Build inline keyboard for initial language selection."""
+	return InlineKeyboardMarkup(inline_keyboard=[
+		[
+			InlineKeyboardButton(text="Сингальский", callback_data="voice_lang:si"),
+			InlineKeyboardButton(text="Автоопредление", callback_data="voice_lang:auto"),
+		]
+	])
+
+
+@dp.callback_query(F.data.startswith("voice_lang:"))
+async def cb_voice_lang(callback: CallbackQuery) -> None:
+	"""Handle initial language selection for voice processing."""
+	uid = callback.from_user.id
+	lang_choice = callback.data.split(":", 1)[1]
+	
+	# Extract message_id from callback to match pending voice
+	if not callback.message or not callback.message.reply_to_message:
+		await callback.answer("❌ Не удалось найти голосовое сообщение.")
+		return
+	
+	voice_msg_id = callback.message.reply_to_message.message_id
+	key = _voice_key(uid, voice_msg_id)
+	
+	pending_voice_data = _retrieve_pending_voice(key)
+	if pending_voice_data is None:
+		await callback.answer("❌ Голосовое сообщение больше не доступно.")
+		return
+	
+	message, status = pending_voice_data
+	
+	try:
+		# Determine transcription mode based on user selection
+		mode = "si" if lang_choice == "si" else "default"
+		
+		# Start processing with the selected mode
+		process_task = asyncio.create_task(
+			_process_voice(message, status, mode),
+			name=key,
+		)
+		_register_task(key, process_task)
+		
+		await callback.answer("✅")
+		
+		# Delete the language selection message
+		try:
+			await callback.message.delete()
+		except Exception:
+			pass
+	
+	except Exception as e:
+		logger.exception("Error in voice language selection: %s", e)
+		await callback.answer("❌ Ошибка при обработке.")
+
+
 @dp.callback_query(F.data.startswith("model:"))
 async def cb_model(callback: CallbackQuery) -> None:
 	uid = callback.from_user.id
@@ -352,11 +427,27 @@ async def cb_lang(callback: CallbackQuery) -> None:
 
 # ── voice handler ─────────────────────────────────────────────────────────────
 
-async def _process_voice(message: Message, status: Message) -> None:
-	"""Full pipeline: download → transcribe → translate → reply."""
+async def _process_voice(
+	message: Message,
+	status: Message,
+	transcription_mode: str = "default",
+) -> None:
+	"""Full pipeline: download → transcribe → translate → reply.
+	
+	Args:
+		message: The voice message.
+		status: The status message to edit.
+		transcription_mode: "si" for Sinhala model, "default" for standard Whisper.
+	"""
 	uid = message.from_user.id
 	s = user_settings.get(uid)
 	voice_duration: int = message.voice.duration or 1
+	
+	# Determine transcription language based on mode
+	if transcription_mode == "si":
+		language_for_transcription = "si"
+	else:
+		language_for_transcription = s.language
 
 	tmp_path: str | None = None
 	try:
@@ -374,7 +465,12 @@ async def _process_voice(message: Message, status: Message) -> None:
 		# 2. Transcribe — measure time
 		await status.edit_text(f"🎙️ Транскрибирую аудио (модель: `{s.model}`)…")
 		t0 = time.monotonic()
-		transcribed: str = await asyncio.to_thread(transcriber.transcribe, tmp_path, s.model, language=s.language)
+		transcribed: str = await asyncio.to_thread(
+			transcriber.transcribe,
+			tmp_path,
+			s.model,
+			language=language_for_transcription,
+		)
 		transcribe_elapsed = time.monotonic() - t0
 
 		if not transcribed:
@@ -382,9 +478,11 @@ async def _process_voice(message: Message, status: Message) -> None:
 			return
 
 		# 3. Translate
-		lang_label = user_settings.LANGUAGE_LABELS.get(s.language, s.language)
+		# Determine which language to show in UI
+		display_lang = language_for_transcription if language_for_transcription is not None else s.language
+		lang_label = user_settings.LANGUAGE_LABELS.get(display_lang, display_lang)
 		await status.edit_text(f"🌐 Перевожу на {lang_label}…")
-		translated: str = await asyncio.to_thread(translator.translate, transcribed, s.language)
+		translated: str = await asyncio.to_thread(translator.translate, transcribed, display_lang)
 
 		# 4. Final reply
 		rtf = transcribe_elapsed / voice_duration
@@ -417,12 +515,14 @@ async def _process_voice(message: Message, status: Message) -> None:
 @dp.message(F.voice)
 async def handle_voice(message: Message) -> None:
 	uid = message.from_user.id
-	# Send initial acknowledgement
-	status = await message.reply("⏳ Сообщение получено, обрабатываю…")
-
-	key = _task_key(uid, message.message_id)
-	task = asyncio.create_task(_process_voice(message, status), name=key)
-	_register_task(key, task)
+	# Send language selection message
+	status = await message.reply(
+		"🌐 Выбери язык:",
+		reply_markup=_voice_lang_keyboard(),
+	)
+	
+	key = _voice_key(uid, message.message_id)
+	_register_pending_voice(key, message, status)
 
 
 @dp.message(Command("benchmark"))
@@ -439,6 +539,8 @@ async def cmd_benchmark(message: Message) -> None:
 	duration = s.last_voice_duration
 	models = user_settings.WHISPER_MODELS
 	results: dict[str, tuple[float, float]] = {}  # model → (elapsed_s, rtf)
+	# Use user's default language for benchmark
+	bench_language = s.language
 
 	def build_status(running: str | None) -> str:
 		lines = [f"🧪 *Бенчмарк Whisper* | аудио: {duration} с\n"]
@@ -470,7 +572,7 @@ async def cmd_benchmark(message: Message) -> None:
 		for i, model in enumerate(models):
 			await safe_edit(build_status(model))
 			t0 = time.monotonic()
-			await asyncio.to_thread(transcriber.transcribe, tmp_path, model, language=s.language)
+			await asyncio.to_thread(transcriber.transcribe, tmp_path, model, language=bench_language)
 			elapsed = time.monotonic() - t0
 			rtf = elapsed / max(duration, 1)
 			results[model] = (elapsed, rtf)
